@@ -61,12 +61,14 @@ add_service_files(
   FILES
   SaveData.srv
   StartSim.srv
-  TrajDes_Srv.srv
+  SrvTrajectoryDesired.srv
   Mocap_Id.srv
-  Controller_Srv.srv
+  SrvControllerChange.srv
   Simulator_Srv.srv
   MocapBodies.srv
   PlannerStart.srv
+  IrisPlusResetNeutral.srv
+  IrisPlusSetNeutral.srv
 )
 
 ## Generate actions in the 'action' folder

@@ -5,7 +5,12 @@ from catkin_pkg.python_setup import generate_distutils_setup
 
 # fetch values from package.xml
 setup_args = generate_distutils_setup(
-    packages=['utilities', 'simulators_hierarchical'],
+    packages=[
+        'utilities',
+        'simulators_hierarchical',
+        'yaw_controllers',
+        'systems_functions',
+        'quadrotor_tracking_controllers_hierarchical'],
     package_dir={'': 'scripts'},
 )
 
