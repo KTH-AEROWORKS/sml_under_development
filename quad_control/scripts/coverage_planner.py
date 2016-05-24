@@ -18,56 +18,62 @@ import random as rdm
 
 
 
-__NAME = rp.get_param('name', 'Axel')
-__OTHERS_NAMES = rp.get_param('others_names', 'Bo Calle David').split()
+__NAME = rp.get_param('name')
+__OTHERS_NAMES = rp.get_param('others_names').split()
 __TOLERANCE = 0.1
+__MAX_SPEED = 1.0
+__GAIN = 0.1
 
-__trade_lock = thd.Lock()
-__pose_lock = thd.Lock()
+__INITIAL_POSE = cov.INITIAL_POSES[__NAME]
+__INITIAL_LANDMARKS = cov.INITIAL_LANDMARKS_LISTS[__NAME]
+__agent = cov.Agent(*__INITIAL_POSE, landmarks=__INITIAL_LANDMARKS)
 
-__landmarks = cov.INITIAL_LANDMARKS_LISTS[__NAME]
-__position = np.zeros(2)
-__versor = cov.versor_from_angle(0.0)
+__lock = thd.Lock()
+
+# __landmarks = cov.INITIAL_LANDMARKS_LISTS[__NAME]
+# __position = np.zeros(2)
+# __versor = cov.versor_from_angle(0.0)
+
 __possible_trade_partners = list(__OTHERS_NAMES)
-__token = rp.get_param('token', False)
+#__token = rp.get_param('token', False)
+__token = rp.get_param('token')
 
-
+__coverage_done_flag = False
+__coverage_done_lock = thd.Lock()
 
 
 
 
 def __trade_landmarks_handler(request):
-    global __pose_lock, __trade_lock
-    global __position, __versor, __landmarks
+    global __lock
+    global __agent
     global __NAME, __OTHERS_NAMES, __possible_trade_partners
-    __pose_lock.acquire()
-    p1 = __position
-    v1 = __versor
-    __pose_lock.release()
-    __trade_lock.acquire()
-    lst1 = __landmarks
-    lst2 = [cov.pos_from_landmark(lmk) for lmk in request.landmarks]
-    p2, v2 = cov.pos_ver_from_pose2D(request.pose)
-    success, remove_from_1, add_to_1, remove_from_2, add_to_2 = cov.reassign_landmarks(p1, v1, p2, v2, lst1, lst2)
+    __lock.acquire()
+    others_landmarks = cov.landmarks_from_point_2d_array(request.landmarks)
+    ox = request.pose.x
+    oy = request.pose.y
+    otheta = request.pose.theta
+    old_landmarks = __agent.get_landmarks()
+    success, indexes_you_remove, landmarks_you_add = __agent.trade(ox, oy, otheta, others_landmarks)
     if success:
-        __landmarks = [__landmarks[index] for index in filter(lambda z: not z in remove_from_1, range(len(__landmarks)))]
-        __landmarks += add_to_1
         __possible_trade_partners = list(__OTHERS_NAMES)
-    else:
-        if request.name in __possible_trade_partners:
-            __possible_trade_partners.remove(request.name)
-    __trade_lock.release()
-    add_to_2 = [cov.landmark_from_pos(pos) for pos in add_to_2]
+        __landmarks_pub.publish(__agent.get_landmark_array())
+    elif request.name in __possible_trade_partners:
+        __possible_trade_partners.remove(request.name)
+    __lock.release()
     rp.logwarn(request.name + ' requests a trade with ' + __NAME)
+    #rp.logwarn(request)
     rp.logwarn('Success of the trade: ' + str(success))
-    return success, remove_from_2, add_to_2
+
+    array_you_add = cov.point_2d_array_from_landmarks(landmarks_you_add)
+    return qsv.TradeLandmarksResponse(success, indexes_you_remove, array_you_add)
 
 
 def __receive_token_handler(request):
-    global __trade_lock
+    global __lock
     global __possible_trade_partners
     global __token
-    __trade_lock.acquire()
+    __lock.acquire()
     if len(__possible_trade_partners) > 0:
         __token = True
         result = True
@@ -75,68 +81,88 @@ def __receive_token_handler(request):
     else:
         result = False
         rp.logwarn(__NAME + ': token refused')
-    __trade_lock.release()
+    __lock.release()
     return result
     
     
+def __coverage_done_callback(msg):
+    global __coverage_done_flag, __coverage_done_lock
+    __coverage_done_lock.acquire()
+    __coverage_done_flag = True
+    __coverage_done_lock.release()
+
     
 def __pose_callback(pose):
-    global __pose_lock
-    global __position, __versor
-    __pose_lock.acquire()
-    __position, __versor = cov.pos_ver_from_pose2D(pose)
-    __pose_lock.release()
+    global __lock
+    global __agent
+    __lock.acquire()
+    __agent.set_pose(pose.x, pose.y, pose.theta)
+    __lock.release()
     
     
     
 rp.init_node('coverage_planner')
 __initial_time = rp.get_time()
 __RATE = rp.Rate(1e2)
-rp.Subscriber('pose_2d', gms.Pose2D, __pose_callback)
-rp.Service('trade_landmarks', qsv.TradeLandmarks, __trade_landmarks_handler)
-rp.Service('receive_token', qsv.ReceiveToken, __receive_token_handler)
+rp.Subscriber('coverage_pose_2d', gms.Pose2D, __pose_callback)
+rp.Service('coverage_trade_landmarks', qsv.TradeLandmarks, __trade_landmarks_handler)
+rp.Service('coverage_receive_token', qsv.ReceiveToken, __receive_token_handler)
 __trade_proxies = {}
 __token_proxies = {}
 for name in __OTHERS_NAMES:
-    __trade_proxies[name] = rp.ServiceProxy('/' + name + '/trade_landmarks', qsv.TradeLandmarks)
-    __token_proxies[name] = rp.ServiceProxy('/' + name + '/receive_token', qsv.ReceiveToken)
-__cmd_vel_pub = rp.Publisher('cmd_vel', gms.Pose2D, queue_size=10)
-__cov_pub = rp.Publisher('coverage', sms.Float64, queue_size=10)
+    rp.wait_for_service('/' + name + '/coverage_trade_landmarks')
+    __trade_proxies[name] = rp.ServiceProxy('/' + name + '/coverage_trade_landmarks', qsv.TradeLandmarks)
+    rp.wait_for_service('/' + name + '/coverage_receive_token')
+    __token_proxies[name] = rp.ServiceProxy('/' + name + '/coverage_receive_token', qsv.ReceiveToken)
+__cmd_vel_pub = rp.Publisher('coverage_cmd_vel', gms.Pose2D, queue_size=10)
+__num_landmarks_pub = rp.Publisher('coverage_num_landmarks', sms.Int32, queue_size=10)
+__cov_pub = rp.Publisher('coverage_coverage', sms.Float64, queue_size=10)
+__landmarks_pub = rp.Publisher('coverage_landmarks', qms.Point2DArray, queue_size=10)
+__coverage_done_pub = rp.Publisher('/coverage_done', sms.Empty, queue_size=10)
+__coverage_done_sub = rp.Subscriber('/coverage_done', sms.Empty, __coverage_done_callback)
+
 
 
 def __work():
-    global __pose_lock, __trade_lock
-    global __position, __versor, __landmarks
+    global __lock
+    global __agent
     global __NAME, __OTHERS_NAMES, __possible_trade_partners
     global __token
-    global __cmd_vel_pub, __cov_pub
+    global __cmd_vel_pub, __cov_pub, __agent_pub
     global __initial_time
-    __pose_lock.acquire()
-    __trade_lock.acquire()
-    dot_p = cov.coverage_gradient_pos(__position, __versor, __landmarks)
-    dot_theta = cov.coverage_gradient_ver(__position, __versor, __landmarks)
-    coverage = cov.coverage_function(__position, __versor, __landmarks)
-    pose = gms.Pose2D(__position[0], __position[1], cov.angle_from_versor(__versor))
-    __trade_lock.release()
-    __pose_lock.release()
-    if np.linalg.norm(dot_p) > 10.3:
-        dot_p *= 10.3/np.linalg.norm(dot_p)
-    dot_theta = np.clip(dot_theta, -10.0, 10.0)
+    __lock.acquire()
+    dot_p = __GAIN*__agent.position_coverage_gradient()
+    dot_theta = __GAIN*__agent.orientation_coverage_gradient()
+    __cov_pub.publish(__agent.coverage())
+    __landmarks_pub.publish(__agent.get_landmark_array())
+    #if np.linalg.norm(dot_p) > __MAX_SPEED:
+        #dot_p *= __MAX_SPEED/np.linalg.norm(dot_p)
+    #dot_theta = np.clip(dot_theta, -__MAX_SPEED, __MAX_SPEED)
     cmd_vel = gms.Pose2D(dot_p[0], dot_p[1], dot_theta)
     __cmd_vel_pub.publish(cmd_vel)
-    __cov_pub.publish(coverage)
-    __trade_lock.acquire()
+    __num_landmarks_pub.publish(len(__agent.get_landmarks()))
     if np.linalg.norm(dot_p) < __TOLERANCE and np.linalg.norm(dot_theta) < __TOLERANCE and __token:
         if len(__possible_trade_partners)>0:
-            lmks = [cov.landmark_from_pos(lmk) for lmk in __landmarks]
-            name = rdm.choice(__possible_trade_partners)
-            rsp = __trade_proxies[name](__NAME, pose, lmks)
-            if rsp.success:
+            partner = rdm.choice(__possible_trade_partners)
+            pose = __agent.get_pose_2d()
+            landmark_array = __agent.get_landmark_array()
+            assert len(landmark_array.data) == len(__agent.get_landmarks())
+            response = __trade_proxies[partner](__NAME, pose, landmark_array)
+            if response.success:
                 __possible_trade_partners = list(__OTHERS_NAMES)
-                __landmarks = [__landmarks[index] for index in filter(lambda z: not z in rsp.to_remove, range(len(__landmarks)))]
-                __landmarks += [cov.pos_from_landmark(lmk) for lmk in rsp.to_add]
+                indexes_to_remove = response.indexes_to_remove
+                landmarks_to_add = cov.landmarks_from_point_2d_array(response.landmarks_to_add)
+                __agent.update_landmarks(indexes_to_remove, landmarks_to_add)
+                #new_landmarks = [cov.Landmark.from_pose2d(lmk) for lmk in response.landmarks.data]
+                #__agent.set_landmarks(new_landmarks)
+                #assert len(__agent.get_landmarks()) == len(new_landmarks)
+                #array = __agent.get_landmark_array()
+                #assert len(array.data) == len(new_landmarks)
+                #__landmarks_pub.publish(array)
             else:
-                __possible_trade_partners.remove(name)
+                __possible_trade_partners.remove(partner)
+                # new_landmarks = [cov.Landmark.from_pose2d(lmk) for lmk in response.landmarks.data]
+                # __agent.set_landmarks(new_landmarks)
         token_accepted = False
         possible_token_receivers = list(__OTHERS_NAMES)
         while not token_accepted and len(possible_token_receivers)>0:
@@ -150,13 +176,17 @@ def __work():
         elif len(__possible_trade_partners) == 0:
             final_time = rp.get_time()
             rp.logwarn('Finish! Elapsed time: ' + str(final_time-__initial_time))
+            __coverage_done_pub.publish(sms.Empty())
             __token = False
-    __trade_lock.release()
+    __lock.release()
     
     
 
 
-
-while not rp.is_shutdown():
+__lock.acquire()
+while not rp.is_shutdown() and not __coverage_done_flag:
+    __lock.release()
     __work()
     __RATE.sleep()
+    __lock.acquire()
+__lock.release()
